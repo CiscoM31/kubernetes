@@ -20,9 +20,9 @@ import (
 	"reflect"
 	"testing"
 
+	"k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/kubernetes/pkg/api/v1"
 	priorityutil "k8s.io/kubernetes/plugin/pkg/scheduler/algorithm/priorities/util"
 	"k8s.io/kubernetes/plugin/pkg/scheduler/schedulercache"
 )
@@ -85,13 +85,31 @@ func TestPriorityMetadata(t *testing.T) {
 					ImagePullPolicy: "Always",
 					Resources: v1.ResourceRequirements{
 						Requests: v1.ResourceList{
-							"cpu":    resource.MustParse("200m"),
-							"memory": resource.MustParse("2000"),
+							v1.ResourceCPU:    resource.MustParse("200m"),
+							v1.ResourceMemory: resource.MustParse("2000"),
 						},
 					},
 				},
 			},
 			Tolerations: tolerations,
+		},
+	}
+	podWithAffinityAndRequests := &v1.Pod{
+		Spec: v1.PodSpec{
+			Containers: []v1.Container{
+				{
+					Name:            "container",
+					Image:           "image",
+					ImagePullPolicy: "Always",
+					Resources: v1.ResourceRequirements{
+						Requests: v1.ResourceList{
+							v1.ResourceCPU:    resource.MustParse("200m"),
+							v1.ResourceMemory: resource.MustParse("2000"),
+						},
+					},
+				},
+			},
+			Affinity: podAffinity,
 		},
 	}
 	tests := []struct {
@@ -119,6 +137,15 @@ func TestPriorityMetadata(t *testing.T) {
 				nonZeroRequest: specifiedReqs,
 				podTolerations: tolerations,
 				affinity:       nil,
+			},
+			test: "Produce a priorityMetadata with specified requests",
+		},
+		{
+			pod: podWithAffinityAndRequests,
+			expected: &priorityMetadata{
+				nonZeroRequest: specifiedReqs,
+				podTolerations: nil,
+				affinity:       podAffinity,
 			},
 			test: "Produce a priorityMetadata with specified requests",
 		},

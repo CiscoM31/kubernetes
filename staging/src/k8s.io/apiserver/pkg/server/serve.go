@@ -17,13 +17,13 @@ limitations under the License.
 package server
 
 import (
+	"context"
 	"crypto/tls"
 	"crypto/x509"
 	"fmt"
 	"net"
 	"net/http"
 	"strings"
-	"sync"
 	"time"
 
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
@@ -85,13 +85,13 @@ func (s *GenericAPIServer) serveSecurely(stopCh <-chan struct{}) error {
 
 	glog.Infof("Serving securely on %s", s.SecureServingInfo.BindAddress)
 	var err error
-	s.effectiveSecurePort, err = RunServer(secureServer, s.SecureServingInfo.BindNetwork, stopCh)
+	s.effectiveSecurePort, err = RunServer(secureServer, s.SecureServingInfo.BindNetwork, s.ShutdownTimeout, stopCh)
 	return err
 }
 
 // RunServer listens on the given port, then spawns a go-routine continuously serving
 // until the stopCh is closed. The port is returned. This function does not block.
-func RunServer(server *http.Server, network string, stopCh <-chan struct{}) (int, error) {
+func RunServer(server *http.Server, network string, shutDownTimeout time.Duration, stopCh <-chan struct{}) (int, error) {
 	if len(server.Addr) == 0 {
 		return 0, errors.New("address cannot be empty")
 	}
@@ -100,7 +100,6 @@ func RunServer(server *http.Server, network string, stopCh <-chan struct{}) (int
 		network = "tcp"
 	}
 
-	// first listen is synchronous (fail early!)
 	ln, err := net.Listen(network, server.Addr)
 	if err != nil {
 		return 0, fmt.Errorf("failed to listen on %v: %v", server.Addr, err)
@@ -113,52 +112,31 @@ func RunServer(server *http.Server, network string, stopCh <-chan struct{}) (int
 		return 0, fmt.Errorf("invalid listen address: %q", ln.Addr().String())
 	}
 
-	lock := sync.Mutex{} // to avoid we close an old listener during a listen retry
+	// Shutdown server gracefully.
 	go func() {
 		<-stopCh
-		lock.Lock()
-		defer lock.Unlock()
-		ln.Close()
+		ctx, cancel := context.WithTimeout(context.Background(), shutDownTimeout)
+		server.Shutdown(ctx)
+		cancel()
 	}()
 
 	go func() {
 		defer utilruntime.HandleCrash()
 
-		for {
-			var listener net.Listener
-			listener = tcpKeepAliveListener{ln.(*net.TCPListener)}
-			if server.TLSConfig != nil {
-				listener = tls.NewListener(listener, server.TLSConfig)
-			}
+		var listener net.Listener
+		listener = tcpKeepAliveListener{ln.(*net.TCPListener)}
+		if server.TLSConfig != nil {
+			listener = tls.NewListener(listener, server.TLSConfig)
+		}
 
-			err := server.Serve(listener)
-			glog.Errorf("Error serving %v (%v); will try again.", server.Addr, err)
+		err := server.Serve(listener)
 
-			// listen again
-			func() {
-				lock.Lock()
-				defer lock.Unlock()
-				for {
-					time.Sleep(15 * time.Second)
-
-					ln, err = net.Listen(network, server.Addr)
-					if err == nil {
-						return
-					}
-					select {
-					case <-stopCh:
-						return
-					default:
-					}
-					glog.Errorf("Error listening on %v (%v); will try again.", server.Addr, err)
-				}
-			}()
-
-			select {
-			case <-stopCh:
-				return
-			default:
-			}
+		msg := fmt.Sprintf("Stopped listening on %s", tcpAddr.String())
+		select {
+		case <-stopCh:
+			glog.Info(msg)
+		default:
+			panic(fmt.Sprintf("%s due to error: %v", msg, err))
 		}
 	}()
 

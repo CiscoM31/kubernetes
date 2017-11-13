@@ -19,13 +19,17 @@ package server
 import (
 	"net"
 	"net/http"
+	"time"
 
 	"github.com/golang/glog"
 
+	"k8s.io/apiserver/pkg/authentication/user"
 	genericapifilters "k8s.io/apiserver/pkg/endpoints/filters"
 	apirequest "k8s.io/apiserver/pkg/endpoints/request"
+	"k8s.io/apiserver/pkg/features"
 	"k8s.io/apiserver/pkg/server"
 	genericfilters "k8s.io/apiserver/pkg/server/filters"
+	utilfeature "k8s.io/apiserver/pkg/util/feature"
 	"k8s.io/client-go/rest"
 )
 
@@ -34,13 +38,20 @@ import (
 // InsecureServingInfo *ServingInfo
 
 func BuildInsecureHandlerChain(apiHandler http.Handler, c *server.Config) http.Handler {
-	handler := genericapifilters.WithAudit(apiHandler, c.RequestContextMapper, c.AuditWriter)
+	handler := apiHandler
+	if utilfeature.DefaultFeatureGate.Enabled(features.AdvancedAuditing) {
+		handler = genericapifilters.WithAudit(handler, c.RequestContextMapper, c.AuditBackend, c.AuditPolicyChecker, c.LongRunningFunc)
+	} else {
+		handler = genericapifilters.WithLegacyAudit(handler, c.RequestContextMapper, c.LegacyAuditWriter)
+	}
+	handler = genericapifilters.WithAuthentication(handler, c.RequestContextMapper, insecureSuperuser{}, nil)
 	handler = genericfilters.WithCORS(handler, c.CorsAllowedOriginList, nil, nil, nil, "true")
-	handler = genericfilters.WithPanicRecovery(handler, c.RequestContextMapper)
-	handler = genericfilters.WithTimeoutForNonLongRunningRequests(handler, c.RequestContextMapper, c.LongRunningFunc)
+	handler = genericfilters.WithTimeoutForNonLongRunningRequests(handler, c.RequestContextMapper, c.LongRunningFunc, c.RequestTimeout)
 	handler = genericfilters.WithMaxInFlightLimit(handler, c.MaxRequestsInFlight, c.MaxMutatingRequestsInFlight, c.RequestContextMapper, c.LongRunningFunc)
+	handler = genericfilters.WithWaitGroup(handler, c.RequestContextMapper, c.LongRunningFunc, c.HandlerChainWaitGroup)
 	handler = genericapifilters.WithRequestInfo(handler, server.NewRequestInfoResolver(c), c.RequestContextMapper)
 	handler = apirequest.WithRequestContext(handler, c.RequestContextMapper)
+	handler = genericfilters.WithPanicRecovery(handler)
 
 	return handler
 }
@@ -75,12 +86,12 @@ func (s *InsecureServingInfo) NewLoopbackClientConfig(token string) (*rest.Confi
 
 // NonBlockingRun spawns the insecure http server. An error is
 // returned if the ports cannot be listened on.
-func NonBlockingRun(insecureServingInfo *InsecureServingInfo, insecureHandler http.Handler, stopCh <-chan struct{}) error {
+func NonBlockingRun(insecureServingInfo *InsecureServingInfo, insecureHandler http.Handler, shutDownTimeout time.Duration, stopCh <-chan struct{}) error {
 	// Use an internal stop channel to allow cleanup of the listeners on error.
 	internalStopCh := make(chan struct{})
 
 	if insecureServingInfo != nil && insecureHandler != nil {
-		if err := serveInsecurely(insecureServingInfo, insecureHandler, internalStopCh); err != nil {
+		if err := serveInsecurely(insecureServingInfo, insecureHandler, shutDownTimeout, internalStopCh); err != nil {
 			close(internalStopCh)
 			return err
 		}
@@ -100,7 +111,7 @@ func NonBlockingRun(insecureServingInfo *InsecureServingInfo, insecureHandler ht
 // serveInsecurely run the insecure http server. It fails only if the initial listen
 // call fails. The actual server loop (stoppable by closing stopCh) runs in a go
 // routine, i.e. serveInsecurely does not block.
-func serveInsecurely(insecureServingInfo *InsecureServingInfo, insecureHandler http.Handler, stopCh <-chan struct{}) error {
+func serveInsecurely(insecureServingInfo *InsecureServingInfo, insecureHandler http.Handler, shutDownTimeout time.Duration, stopCh <-chan struct{}) error {
 	insecureServer := &http.Server{
 		Addr:           insecureServingInfo.BindAddress,
 		Handler:        insecureHandler,
@@ -108,6 +119,18 @@ func serveInsecurely(insecureServingInfo *InsecureServingInfo, insecureHandler h
 	}
 	glog.Infof("Serving insecurely on %s", insecureServingInfo.BindAddress)
 	var err error
-	_, err = server.RunServer(insecureServer, insecureServingInfo.BindNetwork, stopCh)
+	_, err = server.RunServer(insecureServer, insecureServingInfo.BindNetwork, shutDownTimeout, stopCh)
 	return err
+}
+
+// insecureSuperuser implements authenticator.Request to always return a superuser.
+// This is functionally equivalent to skipping authentication and authorization,
+// but allows apiserver code to stop special-casing a nil user to skip authorization checks.
+type insecureSuperuser struct{}
+
+func (insecureSuperuser) AuthenticateRequest(req *http.Request) (user.Info, bool, error) {
+	return &user.DefaultInfo{
+		Name:   "system:unsecured",
+		Groups: []string{user.SystemPrivilegedGroup, user.AllAuthenticated},
+	}, true, nil
 }

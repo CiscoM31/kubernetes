@@ -38,7 +38,7 @@ import (
 	utilerrors "k8s.io/apimachinery/pkg/util/errors"
 	"k8s.io/apimachinery/pkg/util/yaml"
 	"k8s.io/apimachinery/pkg/watch"
-	"k8s.io/kubernetes/pkg/api/validation"
+	"k8s.io/kubernetes/pkg/kubectl/validation"
 )
 
 const (
@@ -487,11 +487,12 @@ func (v *FileVisitor) Visit(fn VisitorFunc) error {
 		f = os.Stdin
 	} else {
 		var err error
-		if f, err = os.Open(v.Path); err != nil {
+		f, err = os.Open(v.Path)
+		if err != nil {
 			return err
 		}
+		defer f.Close()
 	}
-	defer f.Close()
 
 	// TODO: Consider adding a flag to force to UTF16, apparently some
 	// Windows tools don't write the BOM
@@ -648,6 +649,16 @@ func RetrieveLazy(info *Info, err error) error {
 	return nil
 }
 
+// CreateAndRefresh creates an object from input info and refreshes info with that object
+func CreateAndRefresh(info *Info) error {
+	obj, err := NewHelper(info.Client, info.Mapping).Create(info.Namespace, true, info.Object)
+	if err != nil {
+		return err
+	}
+	info.Refresh(obj, true)
+	return nil
+}
+
 type FilterFunc func(info *Info, err error) (bool, error)
 
 type FilteredVisitor struct {
@@ -680,7 +691,7 @@ func (v FilteredVisitor) Visit(fn VisitorFunc) error {
 	})
 }
 
-func FilterBySelector(s labels.Selector) FilterFunc {
+func FilterByLabelSelector(s labels.Selector) FilterFunc {
 	return func(info *Info, err error) (bool, error) {
 		if err != nil {
 			return false, err
