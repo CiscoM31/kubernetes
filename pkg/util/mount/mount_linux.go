@@ -132,7 +132,7 @@ func doMount(mounterPath string, mountCmd string, source string, target string, 
         		output, err = command.CombinedOutput()
         		if err != nil {
                 		switch {
-                		case err == utilExec.ErrExecutableNotFound:
+                		case err == utilexec.ErrExecutableNotFound:
                         		glog.Warningf("'xfs_growfs' not found on system; continuing mount without running 'xfs_growfs'.")
                         		return nil
                 		}
